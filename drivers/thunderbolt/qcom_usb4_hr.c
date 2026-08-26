@@ -44,6 +44,9 @@ static const char * const qcom_usb4_hr_resets[] = {
 
 struct qcom_usb4_hr {
 	void __iomem *regs[ARRAY_SIZE(qcom_usb4_hr_regs)];
+	void __iomem *ucsb;      /* UCS0 mailbox @ 0x81F20040, ACPI QCOM0CA4 */
+	int uc_irq;
+	void __iomem *win;       /* ACPI PRT0 flat window, window0 base */
 	struct clk_bulk_data clocks[ARRAY_SIZE(qcom_usb4_hr_clocks)];
 	struct reset_control_bulk_data resets[ARRAY_SIZE(qcom_usb4_hr_resets)];
 	struct phy *usb4_phy;
@@ -96,10 +99,24 @@ static const struct tb_nhi_ops qcom_usb4_hr_nhi_ops = {
 	.init_interrupts = qcom_usb4_hr_init_interrupts,
 };
 
+/*
+ * ACPI PRT0 _CRS gives ONE flat window (default 0x1563F000, 768K) and the
+ * Windows filter addresses everything relative to it: fw at +0x13000,
+ * uc ctl at +0x22000, gates at +0xd064/+0x18, ready at +0x18. The DTB's
+ * separate low-block regions (0x15600000..0x15624fff) have no ACPI
+ * backing; reads there alias host DRAM.
+ */
+static unsigned long long window0 = 0x1563F000;
+module_param(window0, ullong, 0444);
+MODULE_PARM_DESC(window0, "USB4 router flat window physical base");
+
+static irqreturn_t qcom_usb4_hr_uc_irq(int irq, void *data);
+
 static int __qcom_usb4_hr_nhi_preflight(struct qcom_usb4_hr *hr,
 					struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
+	int ret;
 
 	hr->ring_irq = platform_get_irq_byname(pdev, "ring");
 	if (hr->ring_irq < 0)
@@ -118,6 +135,23 @@ static int __qcom_usb4_hr_nhi_preflight(struct qcom_usb4_hr *hr,
 	if (IS_ERR(hr->usb4_phy))
 		return dev_err_probe(dev, PTR_ERR(hr->usb4_phy),
 				     "USB4 PHY is not available\n");
+
+	hr->uc_irq = platform_get_irq_byname_optional(pdev, "uc");
+	if (hr->uc_irq < 0) {
+		dev_warn(dev, "no \"uc\" interrupt (pre-ACPI DTB?)\n");
+	} else {
+		ret = devm_request_irq(dev, hr->uc_irq,
+				       qcom_usb4_hr_uc_irq, 0,
+				       "qcom-usb4-hr-uc", hr);
+		if (ret)
+			dev_warn(dev, "uc irq request failed: %d\n", ret);
+		else
+			dev_info(dev, "uc irq %d armed\n", hr->uc_irq);
+	}
+
+	hr->ucsb = devm_ioremap(dev, 0x81F20040, 0x40);
+	if (!hr->ucsb)
+		dev_warn(dev, "could not map UCS0 mailbox\n");
 
 	dev_info(dev,
 		 "NHI preflight passed: aperture=%p ring_irq=%d fw_irq=%d; activation=%s\n",
@@ -201,15 +235,17 @@ MODULE_PARM_DESC(usbap_allow,
  * mechanism is identified from the Windows ACPI resource table.
  */
 static bool fw_load_allow;
-module_param_named(fw_load_allow, fw_load_allow, bool, 0444);
+module_param_named(fw_load_allow, fw_load_allow, bool, 0644);
 MODULE_PARM_DESC(fw_load_allow,
-		 "allow the (mis-mapped, kernel-corrupting) UC firmware load");
+		 "allow the UC firmware stream into the window0 fw area");
 
 static int qcom_usb4_hr_uc_bringup(struct qcom_usb4_hr *hr)
 {
 	static const char * const fw_name =
 		"qcom/x1e80100/microsoft/Denali/sp11-usb4-uc-fw.bin";
 	void __iomem *uc_ctl = hr->regs[6] + 0x1000; /* uc_per + 0x1000 */
+	void __iomem *uc_ram = hr->regs[5];         /* uc_ram (writes real;
+						     * reads alias DRAM) */
 	const struct firmware *fw;
 	const __le32 *p, *end;
 	unsigned int i;
@@ -222,50 +258,59 @@ static int qcom_usb4_hr_uc_bringup(struct qcom_usb4_hr *hr)
 	 * experiment README). The UC implements the NHI ring protocol, so
 	 * once it is running the common Thunderbolt stack can talk to it.
 	 */
-	if (!fw_load_allow) {
-		dev_info(hr->nhi.dev,
-			 "hr-bring: firmware load BLOCKED (fw_load_allow=0: uc_ram window aliases host DRAM)\n");
-		return -EPERM;
-	}
-
 	val = readl(uc_ctl);
 	dev_info(hr->nhi.dev, "hr-bring: uc_ctl status=%#x\n", val);
 	if (val & BIT(0)) {
-		dev_info(hr->nhi.dev, "USB4 UC already running (warm start)\n");
-		return 0;
-	}
+		/*
+		 * Warm start: the UC is already executing (boot firmware or
+		 * ADSP started it - we have never loaded real firmware).
+		 * Do NOT halt it; just fall through to gate clearing so the
+		 * router reaches a ring-protocol-accessible state.
+		 */
+		dev_info(hr->nhi.dev,
+			 "USB4 UC already running (warm start); not halting\n");
+	} else if (fw_load_allow) {
+		ret = request_firmware(&fw, fw_name, hr->nhi.dev);
+		if (ret)
+			return dev_err_probe(hr->nhi.dev, ret,
+					     "USB4 UC firmware unavailable\n");
 
-	ret = request_firmware(&fw, fw_name, hr->nhi.dev);
-	if (ret)
-		return dev_err_probe(hr->nhi.dev, ret,
-				     "USB4 UC firmware unavailable\n");
+		/* Halt the UC, then stream {target, count, words[]} segments. */
+		writel(0, uc_ctl);
+		dev_info(hr->nhi.dev, "hr-bring: halted, streaming segments\n");
 
-	/* Halt the UC, then stream the {target, count, words[]} segments. */
-	writel(0, uc_ctl);
-	dev_info(hr->nhi.dev, "hr-bring: halted, streaming segments\n");
+		p = (const __le32 *)fw->data;
+		end = p + fw->size / sizeof(__le32);
+		while (p + 2 <= end) {
+			u32 target = le32_to_cpu(p[0]);
+			u32 count = le32_to_cpu(p[1]);
 
-	p = (const __le32 *)fw->data;
-	end = p + fw->size / sizeof(__le32);
-	while (p + 2 <= end) {
-		u32 target = le32_to_cpu(p[0]);
-		u32 count = le32_to_cpu(p[1]);
-
-		p += 2;
-		if (!count || count > 0x4000 ||
-		    target > SZ_64K || p + count > end ||
-		    target + count * sizeof(u32) > (56 * SZ_1K)) {
-			dev_err(hr->nhi.dev, "bad UC firmware segment\n");
-			release_firmware(fw);
-			return -EINVAL;
+			p += 2;
+			if (!count || count > 0x4000 ||
+			    target > SZ_64K || p + count > end ||
+			    target + count * sizeof(u32) > (56 * SZ_1K)) {
+				dev_err(hr->nhi.dev, "bad UC firmware segment\n");
+				release_firmware(fw);
+				return -EINVAL;
+			}
+			for (i = 0; i < count; i++)
+				writel(le32_to_cpu(p[i]),
+				       uc_ram + target + i * sizeof(u32));
+			p += count;
 		}
-		for (i = 0; i < count; i++)
-			writel(le32_to_cpu(p[i]),
-			       hr->regs[5] + target + i * sizeof(u32));
-		p += count;
+		dev_info(hr->nhi.dev, "USB4 UC firmware loaded (%zu bytes)\n",
+			 fw->size);
+		release_firmware(fw);
+	} else {
+		/*
+		 * No load allowed and no warm UC: halt and continue; ready
+		 * may or may not come up, but nothing is corrupted.
+		 */
+		dev_info(hr->nhi.dev,
+			 "hr-bring: firmware load SKIPPED (fw_load_allow=0)\n");
+		writel(0, uc_ctl);
 	}
-	dev_info(hr->nhi.dev, "USB4 UC firmware loaded (%zu bytes)\n",
-		 fw->size);
-	release_firmware(fw);
+
 
 	if (uc_skip_clamp) {
 		dev_info(hr->nhi.dev, "hr-bring: clamp release SKIPPED\n");
@@ -303,18 +348,32 @@ static int qcom_usb4_hr_uc_bringup(struct qcom_usb4_hr *hr)
 	qcom_usb4_hr_rmw(hr->regs[3] + 0x64, 0, BIT(6));   /* port_group */
 	dev_info(hr->nhi.dev, "hr-bring: clearing router_config gate\n");
 	qcom_usb4_hr_rmw(hr->regs[1] + 0x18, 0, BIT(24));  /* router_config */
-	dev_info(hr->nhi.dev, "hr-bring: releasing UC (GO)\n");
-	qcom_usb4_hr_rmw(uc_ctl, 1, BIT(0));               /* GO */
+	if (!(val & BIT(0))) {
+		dev_info(hr->nhi.dev, "hr-bring: releasing UC (GO)\n");
+		qcom_usb4_hr_rmw(uc_ctl, 1, BIT(0));           /* GO */
+	} else {
+		dev_info(hr->nhi.dev, "hr-bring: warm UC, GO not reissued\n");
+	}
 
-	/* Wait for the UC to report ready (router + 0x18, bit 24). */
-	dev_info(hr->nhi.dev, "hr-bring: polling for UC ready\n");
-	ret = readl_poll_timeout(hr->regs[0] + 0x18, val,
-				 val & BIT(24), 5000, 10 * USEC_PER_SEC);
-	if (ret)
-		return dev_err_probe(hr->nhi.dev, ret,
-				     "USB4 UC did not report ready\n");
-
-	dev_info(hr->nhi.dev, "USB4 UC ready\n");
+	/*
+	 * Ready (window0+0x18 BIT24) is a boot-done pulse the UC raises on
+	 * a fresh halt+GO boot. A warm UC already consumed it, so only
+	 * poll when we actually (re)started the UC ourselves.
+	 */
+	if (!(val & BIT(0))) {
+		dev_info(hr->nhi.dev, "hr-bring: polling for UC ready\n");
+		ret = readl_poll_timeout(hr->regs[0] + 0x18, val,
+					 val & BIT(24), 5000,
+					 10 * USEC_PER_SEC);
+		if (ret)
+			return dev_err_probe(hr->nhi.dev, ret,
+					     "USB4 UC did not report ready\n");
+		dev_info(hr->nhi.dev, "USB4 UC ready\n");
+	} else {
+		dev_info(hr->nhi.dev,
+			 "hr-bring: warm UC, skipping ready poll\n");
+		ret = 0;
+	}
 	return 0;
 }
 
@@ -517,14 +576,10 @@ static ssize_t uc_sb_dump_store(struct device *dev,
 	void __iomem *sb;
 	int i;
 
-	if (!hr)
+	if (!hr || !hr->regs[4])
 		return -ENODEV;
-	if (!qcom_usb4_hr_is_live(pdev)) {
-		dev_info(dev, "uc_sb: UC not live yet\n");
-		return -EPERM;
-	}
 
-	sb = hr->regs[4]; /* sideband @ 0x15612000 */
+	sb = hr->regs[4]; /* sideband @ 0x15612000 (reads may alias) */
 	dev_info(dev, "hr-sb: dump start\n");
 	for (i = 0; i < 0x40; i += 4) {
 		u32 v = readl(sb + i);
@@ -549,16 +604,12 @@ static ssize_t uc_ram_dump_store(struct device *dev,
 {
 	struct platform_device *pdev = to_platform_device(dev);
 	struct qcom_usb4_hr *hr = platform_get_drvdata(pdev);
-	void __iomem *ram = hr->regs[5]; /* uc_ram @ 0x15613000, 0xe000 */
+	void __iomem *ram = hr->regs[5]; /* uc_ram (reads may alias DRAM) */
 	size_t off, run;
 	char line[96];
 
-	if (!hr)
+	if (!hr || !hr->regs[5])
 		return -ENODEV;
-	if (!qcom_usb4_hr_is_live(pdev)) {
-		dev_info(dev, "uc_ram: UC not live yet\n");
-		return -EPERM;
-	}
 
 	dev_info(dev, "hr-ram: scan start (0xe000 bytes)\n");
 	for (off = 0; off < 0xe000; off += max_t(size_t, run, 4)) {
@@ -586,6 +637,44 @@ static ssize_t uc_ram_dump_store(struct device *dev,
 	return count;
 }
 static DEVICE_ATTR_WO(uc_ram_dump);
+
+/*
+ * ACPI PRT0 declares a third interrupt (GSI 287 / SPI 255, edge +
+ * wake-capable) that the DT never had. Log every firing: if this is the
+ * UC firmware/completion line we will see it on plug/boot events.
+ */
+static irqreturn_t qcom_usb4_hr_uc_irq(int irq, void *data)
+{
+	struct qcom_usb4_hr *hr = data;
+
+	dev_info(hr->nhi.dev, "hr-uc: uc irq %d fired\n", irq);
+	return IRQ_HANDLED;
+}
+
+/*
+ * Read-only dump of the UCS0 shared mailbox (ACPI QCOM0CA4, OperationRegion
+ * USBC @ 0x81F20040, 0x2F bytes): INFO, UPDT, then 3 x {connected, mux,
+ * res, vid16, sid16, state64}. Watch UPDT bits change on plug if the ADSP
+ * populates this on Linux too.
+ */
+static ssize_t uc_mailbox_show(struct device *dev,
+			       struct device_attribute *attr, char *buf)
+{
+	struct platform_device *pdev = to_platform_device(dev);
+	struct qcom_usb4_hr *hr = platform_get_drvdata(pdev);
+	int i, n = 0;
+
+	if (!hr || !hr->ucsb)
+		return -ENODEV;
+	for (i = 0; i < 0x2f; i += 4) {
+		u32 v = readl(hr->ucsb + i);
+
+		n += scnprintf(buf + n, PAGE_SIZE - n, "[%#02x] %#010x\n",
+			       i, v);
+	}
+	return n;
+}
+static DEVICE_ATTR_RO(uc_mailbox);
 
 /*
  * Deferred activation: runs the full bring-up (clocks, resets, PHY, clamp
@@ -683,6 +772,8 @@ static int qcom_usb4_hr_probe(struct platform_device *pdev)
 		ret = device_create_file(&pdev->dev, &dev_attr_uc_sb_dump);
 	if (!ret)
 		ret = device_create_file(&pdev->dev, &dev_attr_uc_ram_dump);
+	if (!ret)
+		ret = device_create_file(&pdev->dev, &dev_attr_uc_mailbox);
 
 	dev_info(&pdev->dev,
 		 hr->activated ? "resource validation passed; host-router NHI is active\n" :
@@ -704,6 +795,7 @@ static void qcom_usb4_hr_remove(struct platform_device *pdev)
 	device_remove_file(&pdev->dev, &dev_attr_uc_usbap_rmw);
 	device_remove_file(&pdev->dev, &dev_attr_uc_sb_dump);
 	device_remove_file(&pdev->dev, &dev_attr_uc_ram_dump);
+	device_remove_file(&pdev->dev, &dev_attr_uc_mailbox);
 }
 
 static const struct of_device_id qcom_usb4_hr_of_match[] = {
