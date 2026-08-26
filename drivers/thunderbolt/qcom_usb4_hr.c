@@ -345,6 +345,12 @@ static int qcom_usb4_hr_uc_bringup(struct qcom_usb4_hr *hr)
 
 	/* Clear the two gates, then release the UC. */
 	dev_info(hr->nhi.dev, "hr-bring: clearing port_group gate\n");
+	/*
+	 * Round-17: the two extra writes from the Windows trace (port_group
+	 * 0x7800 config + router_config BIT0 enable) did NOT unlock the UC
+	 * sideband and BROKE the port1 USB3 path (usb4-port1 enable fail).
+	 * REVERTED to the minimal proven flow: two gates only.
+	 */
 	qcom_usb4_hr_rmw(hr->regs[3] + 0x64, 0, BIT(6));   /* port_group */
 	dev_info(hr->nhi.dev, "hr-bring: clearing router_config gate\n");
 	qcom_usb4_hr_rmw(hr->regs[1] + 0x18, 0, BIT(24));  /* router_config */
