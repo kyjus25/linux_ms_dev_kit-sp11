@@ -192,6 +192,19 @@ module_param_named(usbap_allow, uc_usbap_allow, bool, 0444);
 MODULE_PARM_DESC(usbap_allow,
 		 "allow the deadly raw usbap_config RMW experiment");
 
+/*
+ * 2026-08-26 round-9: reading back "uc_ram" after the load returns LINUX
+ * KERNEL STRINGS (driver-core rodata) and zero UC firmware strings - the
+ * 0x15613000 window aliases host DRAM, so every "firmware load" sprayed
+ * ~40KB into kernel memory (explains the corrupted activated flag and
+ * Runtime PM underflows). Block the load until the real UC RAM/IOVA
+ * mechanism is identified from the Windows ACPI resource table.
+ */
+static bool fw_load_allow;
+module_param_named(fw_load_allow, fw_load_allow, bool, 0444);
+MODULE_PARM_DESC(fw_load_allow,
+		 "allow the (mis-mapped, kernel-corrupting) UC firmware load");
+
 static int qcom_usb4_hr_uc_bringup(struct qcom_usb4_hr *hr)
 {
 	static const char * const fw_name =
@@ -209,6 +222,12 @@ static int qcom_usb4_hr_uc_bringup(struct qcom_usb4_hr *hr)
 	 * experiment README). The UC implements the NHI ring protocol, so
 	 * once it is running the common Thunderbolt stack can talk to it.
 	 */
+	if (!fw_load_allow) {
+		dev_info(hr->nhi.dev,
+			 "hr-bring: firmware load BLOCKED (fw_load_allow=0: uc_ram window aliases host DRAM)\n");
+		return -EPERM;
+	}
+
 	val = readl(uc_ctl);
 	dev_info(hr->nhi.dev, "hr-bring: uc_ctl status=%#x\n", val);
 	if (val & BIT(0)) {
@@ -483,6 +502,92 @@ static ssize_t uc_usbap_rmw_store(struct device *dev,
 static DEVICE_ATTR_WO(uc_usbap_rmw);
 
 /*
+ * Sideband-aperture dump (0x15612000, "sideband" region): the UC<->ps883x
+ * SB interface state. A previous session's ucpeek read this region while
+ * the domain was live without a lockup, unlike usbap_config. Each word is
+ * logged immediately after its read so a fatal access is attributable to
+ * one offset.
+ */
+static ssize_t uc_sb_dump_store(struct device *dev,
+				struct device_attribute *attr,
+				const char *buf, size_t count)
+{
+	struct platform_device *pdev = to_platform_device(dev);
+	struct qcom_usb4_hr *hr = platform_get_drvdata(pdev);
+	void __iomem *sb;
+	int i;
+
+	if (!hr)
+		return -ENODEV;
+	if (!qcom_usb4_hr_is_live(pdev)) {
+		dev_info(dev, "uc_sb: UC not live yet\n");
+		return -EPERM;
+	}
+
+	sb = hr->regs[4]; /* sideband @ 0x15612000 */
+	dev_info(dev, "hr-sb: dump start\n");
+	for (i = 0; i < 0x40; i += 4) {
+		u32 v = readl(sb + i);
+
+		dev_info(dev, "hr-sb: [%#02x] = %#010x\n", i, v);
+	}
+	dev_info(dev, "hr-sb: dump done\n");
+	return count;
+}
+static DEVICE_ATTR_WO(uc_sb_dump);
+
+/*
+ * Scan uc_ram (0x15613000, 56K: UC code + data + log ring) for printable
+ * runs. The UC firmware logs via in-memory strings ("Waiting for SB RX
+ * Connect", "SB Connected %p", ...) - this makes the UC tell us verbatim
+ * what it is waiting on. uc_ram is host-safe: firmware is streamed and
+ * Windows reads UC status here.
+ */
+static ssize_t uc_ram_dump_store(struct device *dev,
+				 struct device_attribute *attr,
+				 const char *buf, size_t count)
+{
+	struct platform_device *pdev = to_platform_device(dev);
+	struct qcom_usb4_hr *hr = platform_get_drvdata(pdev);
+	void __iomem *ram = hr->regs[5]; /* uc_ram @ 0x15613000, 0xe000 */
+	size_t off, run;
+	char line[96];
+
+	if (!hr)
+		return -ENODEV;
+	if (!qcom_usb4_hr_is_live(pdev)) {
+		dev_info(dev, "uc_ram: UC not live yet\n");
+		return -EPERM;
+	}
+
+	dev_info(dev, "hr-ram: scan start (0xe000 bytes)\n");
+	for (off = 0; off < 0xe000; off += max_t(size_t, run, 4)) {
+		u32 word = readl(ram + off);
+		u8 c0 = word & 0xff;
+
+		if (c0 < 0x20 || c0 > 0x7e) {
+			run = 4;
+			continue;
+		}
+		run = 0;
+		while (off + run < 0xe000 && run < sizeof(line) - 1) {
+			u32 w = readl(ram + ((off + run) & ~3u));
+			u8 c = (w >> (((off + run) & 3) * 8)) & 0xff;
+
+			if (c < 0x20 || c > 0x7e)
+				break;
+			line[run++] = c;
+		}
+		line[run] = '\0';
+		if (run >= 6)
+			dev_info(dev, "hr-ram: +%#06zx: %s\n", off, line);
+	}
+	dev_info(dev, "hr-ram: scan done\n");
+	return count;
+}
+static DEVICE_ATTR_WO(uc_ram_dump);
+
+/*
  * Deferred activation: runs the full bring-up (clocks, resets, PHY, clamp
  * release, UC firmware load/start, NHI probe) on demand. Used to start the
  * UC only after the Type-C stack has brought the retimer out of reset, so
@@ -574,6 +679,10 @@ static int qcom_usb4_hr_probe(struct platform_device *pdev)
 		ret = device_create_file(&pdev->dev, &dev_attr_uc_activate);
 	if (!ret)
 		ret = device_create_file(&pdev->dev, &dev_attr_uc_usbap_rmw);
+	if (!ret)
+		ret = device_create_file(&pdev->dev, &dev_attr_uc_sb_dump);
+	if (!ret)
+		ret = device_create_file(&pdev->dev, &dev_attr_uc_ram_dump);
 
 	dev_info(&pdev->dev,
 		 hr->activated ? "resource validation passed; host-router NHI is active\n" :
@@ -593,6 +702,8 @@ static void qcom_usb4_hr_remove(struct platform_device *pdev)
 	device_remove_file(&pdev->dev, &dev_attr_uc_ping);
 	device_remove_file(&pdev->dev, &dev_attr_uc_activate);
 	device_remove_file(&pdev->dev, &dev_attr_uc_usbap_rmw);
+	device_remove_file(&pdev->dev, &dev_attr_uc_sb_dump);
+	device_remove_file(&pdev->dev, &dev_attr_uc_ram_dump);
 }
 
 static const struct of_device_id qcom_usb4_hr_of_match[] = {
