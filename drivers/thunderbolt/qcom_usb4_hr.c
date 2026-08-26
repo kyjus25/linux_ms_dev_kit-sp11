@@ -96,20 +96,10 @@ static const struct tb_nhi_ops qcom_usb4_hr_nhi_ops = {
 	.init_interrupts = qcom_usb4_hr_init_interrupts,
 };
 
-static int qcom_usb4_hr_nhi_preflight(struct qcom_usb4_hr *hr,
-					      struct platform_device *pdev)
+static int __qcom_usb4_hr_nhi_preflight(struct qcom_usb4_hr *hr,
+					struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
-
-	/*
-	 * The common NHI code is ready for platform users, but Qualcomm's
-	 * router-specific firmware upload and power-on sequence is not. Keep
-	 * this check explicitly opt-in so a DT node cannot accidentally turn
-	 * the resource validator into a boot-critical driver.
-	 */
-	if (!device_property_read_bool(dev, "qcom,nhi-preflight") &&
-	    !device_property_read_bool(dev, "qcom,nhi-activate"))
-		return 0;
 
 	hr->ring_irq = platform_get_irq_byname(pdev, "ring");
 	if (hr->ring_irq < 0)
@@ -135,6 +125,24 @@ static int qcom_usb4_hr_nhi_preflight(struct qcom_usb4_hr *hr,
 		 device_property_read_bool(dev, "qcom,nhi-activate") ?
 		 "requested" : "disabled");
 	return 0;
+}
+
+static int qcom_usb4_hr_nhi_preflight(struct qcom_usb4_hr *hr,
+				      struct platform_device *pdev)
+{
+	struct device *dev = &pdev->dev;
+
+	/*
+	 * The common NHI code is ready for platform users, but Qualcomm's
+	 * router-specific firmware upload and power-on sequence is not. Keep
+	 * this check explicitly opt-in so a DT node cannot accidentally turn
+	 * the resource validator into a boot-critical driver.
+	 */
+	if (!device_property_read_bool(dev, "qcom,nhi-preflight") &&
+	    !device_property_read_bool(dev, "qcom,nhi-activate"))
+		return 0;
+
+	return __qcom_usb4_hr_nhi_preflight(hr, pdev);
 }
 
 static irqreturn_t qcom_usb4_hr_fw_irq(int irq, void *data)
@@ -165,6 +173,15 @@ static u32 qcom_usb4_hr_rmw(void __iomem *addr, u32 value, u32 mask)
 	return val;
 }
 
+/*
+ * 2026-08-26: fires here hard-lock the SoC silently (verified by netconsole
+ * capture). Off until the correct X1P-aware way to release the clamp exists.
+ */
+static bool uc_skip_clamp = true;
+module_param_named(skip_clamp, uc_skip_clamp, bool, 0444);
+MODULE_PARM_DESC(skip_clamp,
+		 "do not touch the raw USB4 AON clamp register (deadly on X1P)");
+
 static int qcom_usb4_hr_uc_bringup(struct qcom_usb4_hr *hr)
 {
 	static const char * const fw_name =
@@ -183,6 +200,7 @@ static int qcom_usb4_hr_uc_bringup(struct qcom_usb4_hr *hr)
 	 * once it is running the common Thunderbolt stack can talk to it.
 	 */
 	val = readl(uc_ctl);
+	dev_info(hr->nhi.dev, "hr-bring: uc_ctl status=%#x\n", val);
 	if (val & BIT(0)) {
 		dev_info(hr->nhi.dev, "USB4 UC already running (warm start)\n");
 		return 0;
@@ -195,6 +213,7 @@ static int qcom_usb4_hr_uc_bringup(struct qcom_usb4_hr *hr)
 
 	/* Halt the UC, then stream the {target, count, words[]} segments. */
 	writel(0, uc_ctl);
+	dev_info(hr->nhi.dev, "hr-bring: halted, streaming segments\n");
 
 	p = (const __le32 *)fw->data;
 	end = p + fw->size / sizeof(__le32);
@@ -219,24 +238,30 @@ static int qcom_usb4_hr_uc_bringup(struct qcom_usb4_hr *hr)
 		 fw->size);
 	release_firmware(fw);
 
-	/*
-	 * The QMP driver leaves the USB4 AON clamp engaged (com_init sets it
-	 * and only the autonomous-mode path clears it, which never runs for
-	 * the router). With the clamp set the PHY pins are isolated and the
-	 * UC cannot see the partner. Release it: the router owns the pins.
-	 */
-	{
+	if (uc_skip_clamp) {
+		dev_info(hr->nhi.dev, "hr-bring: clamp release SKIPPED\n");
+	} else {
+		/*
+		 * The QMP driver leaves the USB4 AON clamp engaged (com_init
+		 * sets it and only the autonomous-mode path clears it, which
+		 * never runs for the router). With the clamp set the PHY pins
+		 * are isolated and the UC cannot see the partner. Release it:
+		 * the router owns the pins.
+		 */
 		struct device_node *np = hr->usb4_phy->dev.of_node;
 		void __iomem *phy_base = of_iomap(np, 0);
+		u32 v;
 
+		dev_info(hr->nhi.dev, "hr-bring: clamp map=%p\n", phy_base);
 		if (phy_base) {
 			void __iomem *clmp = phy_base + 0x104;
-			u32 v = readl(clmp);
 
+			v = readl(clmp);
+			dev_info(hr->nhi.dev, "hr-bring: clamp read=%#x\n", v);
 			writel(v & ~0x01010101u, clmp);
 			dev_info(hr->nhi.dev,
-				 "USB4 AON clamp: %#x -> %#x\n",
-				 v, readl(clmp));
+				 "hr-bring: USB4 AON clamp written, now=%#x\n",
+				 readl(clmp));
 			iounmap(phy_base);
 		} else {
 			dev_warn(hr->nhi.dev,
@@ -245,11 +270,15 @@ static int qcom_usb4_hr_uc_bringup(struct qcom_usb4_hr *hr)
 	}
 
 	/* Clear the two gates, then release the UC. */
+	dev_info(hr->nhi.dev, "hr-bring: clearing port_group gate\n");
 	qcom_usb4_hr_rmw(hr->regs[3] + 0x64, 0, BIT(6));   /* port_group */
+	dev_info(hr->nhi.dev, "hr-bring: clearing router_config gate\n");
 	qcom_usb4_hr_rmw(hr->regs[1] + 0x18, 0, BIT(24));  /* router_config */
+	dev_info(hr->nhi.dev, "hr-bring: releasing UC (GO)\n");
 	qcom_usb4_hr_rmw(uc_ctl, 1, BIT(0));               /* GO */
 
 	/* Wait for the UC to report ready (router + 0x18, bit 24). */
+	dev_info(hr->nhi.dev, "hr-bring: polling for UC ready\n");
 	ret = readl_poll_timeout(hr->regs[0] + 0x18, val,
 				 val & BIT(24), 5000, 10 * USEC_PER_SEC);
 	if (ret)
@@ -261,7 +290,7 @@ static int qcom_usb4_hr_uc_bringup(struct qcom_usb4_hr *hr)
 }
 
 static int qcom_usb4_hr_activate(struct qcom_usb4_hr *hr,
-					struct platform_device *pdev)
+					struct platform_device *pdev, bool force)
 {
 	struct device *dev = &pdev->dev;
 	int ret;
@@ -270,32 +299,43 @@ static int qcom_usb4_hr_activate(struct qcom_usb4_hr *hr,
 	 * This is deliberately separate from the resource preflight.  The
 	 * common NHI probe resets and touches the router, so only an explicitly
 	 * named DT experiment may reach it.  No Qualcomm mailbox or firmware
-	 * upload sequence is inferred here.
+	 * upload sequence is inferred here.  force=true bypasses the DT gate
+	 * for the deferred sysfs-triggered activation.
 	 */
-	if (!device_property_read_bool(dev, "qcom,nhi-activate"))
+	if (!force && !device_property_read_bool(dev, "qcom,nhi-activate"))
 		return 0;
+
+	dev_info(dev, "hr-act: step0 activation entered%s\n",
+		 force ? " (sysfs)" : "");
 
 	ret = clk_bulk_prepare_enable(ARRAY_SIZE(hr->clocks), hr->clocks);
 	if (ret)
 		return dev_err_probe(dev, ret,
 				     "failed to enable host-router clocks\n");
+	dev_info(dev, "hr-act: step1 clocks enabled\n");
 
 	ret = reset_control_bulk_deassert(ARRAY_SIZE(hr->resets), hr->resets);
 	if (ret)
 		goto err_disable_clocks;
+	dev_info(dev, "hr-act: step2 resets deasserted\n");
 
+	dev_info(dev, "hr-act: step3 setting PHY mode TBT3\n");
 	ret = phy_set_mode_ext(hr->usb4_phy, PHY_MODE_TBT, PHY_SUBMODE_TBT3);
 	if (ret)
 		goto err_assert_resets;
+	dev_info(dev, "hr-act: step3a phy_set_mode_ext done\n");
 
 	ret = phy_init(hr->usb4_phy);
 	if (ret)
 		goto err_assert_resets;
+	dev_info(dev, "hr-act: step4 phy_init done\n");
 
 	ret = qcom_usb4_hr_uc_bringup(hr);
 	if (ret)
 		goto err_exit_phy;
+	dev_info(dev, "hr-act: step5 UC bringup done\n");
 
+	dev_info(dev, "hr-act: step6 calling nhi_probe\n");
 	ret = nhi_probe(&hr->nhi);
 	if (ret)
 		goto err_exit_phy;
@@ -370,6 +410,37 @@ static ssize_t uc_ping_store(struct device *dev, struct device_attribute *attr,
 }
 static DEVICE_ATTR_WO(uc_ping);
 
+/*
+ * Deferred activation: runs the full bring-up (clocks, resets, PHY, clamp
+ * release, UC firmware load/start, NHI probe) on demand. Used to start the
+ * UC only after the Type-C stack has brought the retimer out of reset, so
+ * the UC's init-time sideband discovery sees a live target.
+ */
+static ssize_t uc_activate_store(struct device *dev,
+				 struct device_attribute *attr,
+				 const char *buf, size_t count)
+{
+	struct platform_device *pdev = to_platform_device(dev);
+	struct qcom_usb4_hr *hr = platform_get_drvdata(pdev);
+	int ret;
+
+	if (!hr)
+		return -ENODEV;
+	if (hr->activated) {
+		dev_info(dev, "uc_activate: already active\n");
+		return count;
+	}
+	if (!hr->nhi.ops) {
+		ret = __qcom_usb4_hr_nhi_preflight(hr, pdev);
+		if (ret)
+			return ret;
+	}
+
+	ret = qcom_usb4_hr_activate(hr, pdev, true);
+	return ret ? ret : count;
+}
+static DEVICE_ATTR_WO(uc_activate);
+
 static int qcom_usb4_hr_probe(struct platform_device *pdev)
 {
 	struct qcom_usb4_hr *hr;
@@ -421,17 +492,21 @@ static int qcom_usb4_hr_probe(struct platform_device *pdev)
 	if (ret)
 		return ret;
 
-	ret = qcom_usb4_hr_activate(hr, pdev);
+	ret = qcom_usb4_hr_activate(hr, pdev, false);
 	if (ret)
 		return ret;
 
 	ret = device_create_file(&pdev->dev, &dev_attr_uc_ping);
+	if (!ret)
+		ret = device_create_file(&pdev->dev, &dev_attr_uc_activate);
 
 	dev_info(&pdev->dev,
 		 hr->activated ? "resource validation passed; host-router NHI is active\n" :
 		 "resource validation passed; host-router hardware access is disabled\n");
 	return 0;
 }
+
+
 
 
 
