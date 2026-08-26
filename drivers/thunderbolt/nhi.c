@@ -454,6 +454,7 @@ irqreturn_t ring_msix(int irq, void *data)
 
 	return IRQ_HANDLED;
 }
+EXPORT_SYMBOL_GPL(ring_msix);
 
 static int nhi_alloc_hop(struct tb_nhi *nhi, struct tb_ring *ring)
 {
@@ -964,6 +965,7 @@ void nhi_interrupt_work(struct work_struct *work)
 	}
 	spin_unlock_irq(&nhi->lock);
 }
+EXPORT_SYMBOL_GPL(nhi_interrupt_work);
 
 irqreturn_t nhi_msi(int irq, void *data)
 {
@@ -971,6 +973,7 @@ irqreturn_t nhi_msi(int irq, void *data)
 	schedule_work(&nhi->interrupt_work);
 	return IRQ_HANDLED;
 }
+EXPORT_SYMBOL_GPL(nhi_msi);
 
 static int __nhi_suspend_noirq(struct device *dev, bool wakeup)
 {
@@ -1257,6 +1260,7 @@ int nhi_probe(struct tb_nhi *nhi)
 
 	return 0;
 }
+EXPORT_SYMBOL_GPL(nhi_probe);
 
 /*
  * The tunneled pci bridges are siblings of us. Use resume_noirq to reenable

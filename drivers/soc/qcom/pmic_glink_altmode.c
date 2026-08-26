@@ -351,6 +351,12 @@ static void pmic_glink_altmode_worker(struct work_struct *work)
 	struct pmic_glink_altmode *altmode = alt_port->altmode;
 	enum drm_connector_status conn_status;
 
+	dev_info(altmode->dev,
+		 "port %u: altmode notification svid=0x%04x mux=%u mode=%u orientation=%u hpd=%u irq=%u\n",
+		 alt_port->index, alt_port->svid, alt_port->mux_ctrl,
+		 alt_port->mode, alt_port->orientation, alt_port->hpd_state,
+		 alt_port->hpd_irq);
+
 	typec_switch_set(alt_port->typec_switch, alt_port->orientation);
 
 	/*
@@ -488,6 +494,10 @@ static void pmic_glink_altmode_sc8280xp_notify(struct pmic_glink_altmode *altmod
 	alt_port->svid = svid;
 	alt_port->mux_ctrl = notify->mux_ctrl;
 
+	dev_info(altmode->dev,
+		 "port %u: received altmode notification svid=0x%04x mux=%u orientation=%u\n",
+		 port, svid, alt_port->mux_ctrl, alt_port->orientation);
+
 	if (svid == USB_TYPEC_DP_SID) {
 		dp = &notify->extended_data.dp;
 
@@ -513,6 +523,11 @@ static void pmic_glink_altmode_callback(const void *data, size_t len, void *priv
 
 	opcode = le32_to_cpu(hdr->opcode) & 0xff;
 	svid = le32_to_cpu(hdr->opcode) >> 16;
+
+	dev_info(altmode->dev,
+		 "raw altmode message owner=%u type=%u opcode=0x%02x svid=0x%04x len=%zu\n",
+		 le32_to_cpu(hdr->owner), le32_to_cpu(hdr->type), opcode, svid,
+		 len);
 
 	switch (opcode) {
 	case USBC_CMD_WRITE_REQ:
