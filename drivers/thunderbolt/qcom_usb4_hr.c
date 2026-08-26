@@ -644,6 +644,7 @@ static ssize_t uc_ram_dump_store(struct device *dev,
 }
 static DEVICE_ATTR_WO(uc_ram_dump);
 
+
 /*
  * ACPI PRT0 declares a third interrupt (GSI 287 / SPI 255, edge +
  * wake-capable) that the DT never had. Log every firing: if this is the
@@ -780,6 +781,8 @@ static int qcom_usb4_hr_probe(struct platform_device *pdev)
 		ret = device_create_file(&pdev->dev, &dev_attr_uc_ram_dump);
 	if (!ret)
 		ret = device_create_file(&pdev->dev, &dev_attr_uc_mailbox);
+	if (!ret)
+	
 
 	dev_info(&pdev->dev,
 		 hr->activated ? "resource validation passed; host-router NHI is active\n" :
@@ -802,6 +805,7 @@ static void qcom_usb4_hr_remove(struct platform_device *pdev)
 	device_remove_file(&pdev->dev, &dev_attr_uc_sb_dump);
 	device_remove_file(&pdev->dev, &dev_attr_uc_ram_dump);
 	device_remove_file(&pdev->dev, &dev_attr_uc_mailbox);
+
 }
 
 static const struct of_device_id qcom_usb4_hr_of_match[] = {
