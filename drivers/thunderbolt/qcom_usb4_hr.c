@@ -106,6 +106,19 @@ static const struct tb_nhi_ops qcom_usb4_hr_nhi_ops = {
  * separate low-block regions (0x15600000..0x15624fff) have no ACPI
  * backing; reads there alias host DRAM.
  */
+/*
+ * Windows arms the UC's interrupt controller as a separate step after the
+ * UC boots (decoded from QcUsb4Filter function 0x14000ba7c): five
+ * interrupt sources at router+0x20a8, port_group bits 21/22/23 at
+ * +0xd000, and router config bits. Without it the UC never signals the
+ * host - which is why the uc IRQ stayed silent through every plug test.
+ * Runtime-toggleable because a near-identical write once regressed the
+ * port1 USB path.
+ */
+static bool arm_int;
+module_param_named(arm_int, arm_int, bool, 0644);
+MODULE_PARM_DESC(arm_int, "apply the Windows UC interrupt-arming sequence after ready");
+
 static unsigned long long window0 = 0x1563F000;
 module_param(window0, ullong, 0444);
 MODULE_PARM_DESC(window0, "USB4 router flat window physical base");
@@ -379,6 +392,31 @@ static int qcom_usb4_hr_uc_bringup(struct qcom_usb4_hr *hr)
 		dev_info(hr->nhi.dev,
 			 "hr-bring: warm UC, skipping ready poll\n");
 		ret = 0;
+	}
+
+	/*
+	 * UC interrupt/config arming (Windows order, values exact):
+	 * +0x4/+0x2/+0x14 config bits, +0xd000 port_group bits 21-23,
+	 * and the five interrupt sources at router+0x20a8.
+	 */
+	if (arm_int) {
+		dev_info(hr->nhi.dev,
+			 "hr-bring: arming UC interrupts (Windows sequence)\n");
+		qcom_usb4_hr_rmw(hr->regs[0] + 0x4, 0x0, 0x1);
+		qcom_usb4_hr_rmw(hr->regs[0] + 0x2, 0x5, 0x1);
+		qcom_usb4_hr_rmw(hr->regs[3] + 0x0, 0x0, 0x800000);
+		qcom_usb4_hr_rmw(hr->regs[3] + 0x0, 0x0, 0x400000);
+		qcom_usb4_hr_rmw(hr->regs[3] + 0x0, 0x0, 0x200000);
+		qcom_usb4_hr_rmw(hr->regs[0] + 0x4, 0x0, 0x3f00);
+		qcom_usb4_hr_rmw(hr->regs[0] + 0x14, 0x0, 0x4);
+		qcom_usb4_hr_rmw(hr->regs[0] + 0x14, 0x0, 0x2);
+		qcom_usb4_hr_rmw(hr->regs[0] + 0x20a8, 0x0, 0x80000);
+		qcom_usb4_hr_rmw(hr->regs[0] + 0x20a8, 0x0, 0x20000);
+		qcom_usb4_hr_rmw(hr->regs[0] + 0x20a8, 0x0, 0x10000);
+		qcom_usb4_hr_rmw(hr->regs[0] + 0x20a8, 0x0, 0x10);
+		qcom_usb4_hr_rmw(hr->regs[0] + 0x20a8, 0x0, 0x8);
+		qcom_usb4_hr_rmw(hr->regs[0] + 0x2, 0xc, 0xc);
+		dev_info(hr->nhi.dev, "hr-bring: UC interrupts armed\n");
 	}
 	return 0;
 }
