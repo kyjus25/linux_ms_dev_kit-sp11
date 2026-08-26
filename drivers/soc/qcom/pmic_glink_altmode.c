@@ -173,6 +173,22 @@ static int pmic_glink_altmode_request(struct pmic_glink_altmode *altmode, u32 cm
 	return 0;
 }
 
+/*
+ * Surface/X1P USB4 experiments: the ADSP policy engine always enters TBT
+ * tunneling for TBT-capable partners and has no DP fallback, but the
+ * UC sideband link required for tunneling never comes up on Linux.
+ * force_dp: answer TBT notifications by configuring plain DP instead
+ * (mux + retimer + synthetic HPD). nack_on_tbt_reject: withhold the
+ * PAN ACK when the retimer rejects TBT, starving the ADSP state machine
+ * in case it retries with DP.
+ */
+static bool force_dp;
+module_param(force_dp, bool, 0644);
+MODULE_PARM_DESC(force_dp, "answer TBT tunneling notifications with plain DP");
+static bool nack_on_tbt_reject;
+module_param(nack_on_tbt_reject, bool, 0644);
+MODULE_PARM_DESC(nack_on_tbt_reject, "skip PAN ACK when retimer rejects TBT");
+
 static void pmic_glink_altmode_enable_dp(struct pmic_glink_altmode *altmode,
 					 struct pmic_glink_altmode_port *port,
 					 u8 mode, bool hpd_state,
@@ -251,6 +267,11 @@ static void pmic_glink_altmode_enable_tbt(struct pmic_glink_altmode *altmode,
 	port->state.mode = TYPEC_MODAL_STATE(port->mode);
 
 	ret = typec_mux_set(port->typec_mux, &port->state);
+	if (ret && nack_on_tbt_reject) {
+		dev_err(altmode->dev,
+			"mux rejected TBT; withholding PAN ACK (nack_on_tbt_reject)\n");
+		return;
+	}
 	if (ret)
 		dev_err(altmode->dev, "failed to switch mux to USB: %d\n", ret);
 
@@ -381,7 +402,14 @@ static void pmic_glink_altmode_worker(struct work_struct *work)
 
 		drm_aux_hpd_bridge_notify(&alt_port->bridge->dev, conn_status);
 	} else if (alt_port->mux_ctrl == MUX_CTRL_STATE_TUNNELING) {
-		if (alt_port->svid == USB_TYPEC_TBT_SID)
+		if (force_dp) {
+			dev_info(altmode->dev,
+				 "port %u: force_dp: answering TBT notification with DP (4-lane) + HPD\n",
+				 alt_port->index);
+			pmic_glink_altmode_enable_dp(altmode, alt_port, 2, true, false);
+			drm_aux_hpd_bridge_notify(&alt_port->bridge->dev,
+						  connector_status_connected);
+		} else if (alt_port->svid == USB_TYPEC_TBT_SID)
 			pmic_glink_altmode_enable_tbt(altmode, alt_port);
 		else
 			pmic_glink_altmode_enable_usb4(altmode, alt_port);
