@@ -1,0 +1,18 @@
+diff --git a/arch/arm64/boot/dts/qcom/x1-microsoft-denali.dtsi b/arch/arm64/boot/dts/qcom/x1-microsoft-denali.dtsi
+index 5f2646ca7eec..22a628097c63 100644
+--- a/arch/arm64/boot/dts/qcom/x1-microsoft-denali.dtsi
++++ b/arch/arm64/boot/dts/qcom/x1-microsoft-denali.dtsi
+@@ -815,8 +815,6 @@
+ 		retimer-switch;
+ 		orientation-switch;
+ 
+-		parade,disable-usb4;
+-
+ 		ports {
+@@ -880,8 +878,6 @@
+ 		retimer-switch;
+ 		orientation-switch;
+ 
+-		parade,disable-usb4;
+-
+ 		ports {

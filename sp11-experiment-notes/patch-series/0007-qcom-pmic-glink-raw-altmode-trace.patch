@@ -1,0 +1,27 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+Subject: [PATCH 7/7] soc: qcom: pmic-glink: trace raw altmode messages
+
+Log the PMIC-GLINK message header before the altmode parser handles it. This
+distinguishes a missing firmware notification from a notification rejected by
+the Linux parser. The change is diagnostic only.
+
+---
+ drivers/soc/qcom/pmic_glink_altmode.c | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/drivers/soc/qcom/pmic_glink_altmode.c b/drivers/soc/qcom/pmic_glink_altmode.c
+index 4bc867dbd801..000000000000 100644
+--- a/drivers/soc/qcom/pmic_glink_altmode.c
++++ b/drivers/soc/qcom/pmic_glink_altmode.c
+@@ -522,6 +522,11 @@ static void pmic_glink_altmode_callback(const void *data, size_t len, void *priv)
+ 	opcode = le32_to_cpu(hdr->opcode) & 0xff;
+ 	svid = le32_to_cpu(hdr->opcode) >> 16;
++
++	dev_info(altmode->dev,
++		 "raw altmode message owner=%u type=%u opcode=0x%02x svid=0x%04x len=%zu\n",
++		 le32_to_cpu(hdr->owner), le32_to_cpu(hdr->type), opcode, svid,
++		 len);
+ 
+ 	switch (opcode) {
+-- 
+2.43.0
