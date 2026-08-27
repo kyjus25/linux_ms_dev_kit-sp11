@@ -1,0 +1,1 @@
+LABEL=usb4log /mnt/usb4log ext4 noauto,nofail,x-systemd.automount 0 0

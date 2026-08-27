@@ -1,0 +1,20 @@
+#!/bin/sh
+# Load netconsole once Wi-Fi is up, pointing at the Pi (192.168.4.41).
+# Only arms on the USB4-experiment kernel: the deferred DTB has the
+# usb4-host-router node WITHOUT the qcom,nhi-activate property.
+DT=/proc/device-tree/soc@0/usb4-host-router@15600000
+[ -f "$DT/compatible" ] || exit 0
+[ -e "$DT/qcom,nhi-activate" ] && exit 0
+
+SRC=""
+i=0
+while [ $i -lt 30 ]; do
+    SRC=$(ip -4 -o addr show wlP4p1s0 2>/dev/null | awk '{split($4,a,"/");print a[1]}' | head -1)
+    [ -n "$SRC" ] && break
+    sleep 2; i=$((i+1))
+done
+[ -n "$SRC" ] || { echo "no wifi addr; netconsole not armed"; exit 0; }
+
+modprobe netconsole \
+    "netconsole=6666@$SRC/wlP4p1s0,6666@192.168.4.41/e4:5f:01:09:a6:e9"
+echo "netconsole armed: $SRC -> 192.168.4.41:6666"

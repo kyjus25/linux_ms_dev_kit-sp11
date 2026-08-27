@@ -1,0 +1,10 @@
+#!/bin/sh
+exec tail -n +3 "$0"
+
+menuentry '>>> ACTIVATION TEST: X1P usb4-hr-x1p-test root=/dev/nvme0n1p2 <<<' --id 'sp11-x1p-usb4-hr-activation-test' {
+    search --no-floppy --fs-uuid --set=root d419dcd1-fbaa-40aa-a513-e5c25ce6386d
+    echo 'Loading Surface Pro 11 X1P LCD USB4 host-router activation test ...'
+    linux /boot/vmlinuz-7.2.0-usb4-hr-x1p-test root=/dev/nvme0n1p2 ro rootdelay=45 clk_ignore_unused pd_ignore_unused cma=128M efi=novamap console=tty0 loglevel=7 ignore_loglevel plymouth.enable=0 systemd.show_status=1 rd.systemd.show_status=1 systemd.log_level=info systemd.log_target=console arm64.nopauth systemd.tpm2_wait=0 pstore.backend=ramoops soundwire_qcom.sp11_feedback_active_offset2_zero=1 crashkernel=2G-4G:320M,4G-32G:512M,32G-64G:1024M,64G-128G:2048M,128G-:4096M
+    devicetree /boot/sp11-x1p-usb4-hr-activation.dtb
+    initrd /boot/initrd.img-7.2.0-usb4-hr-x1p-test
+}

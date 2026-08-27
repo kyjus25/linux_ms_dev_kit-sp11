@@ -1,0 +1,11 @@
+[Unit]
+Description=Arm netconsole to Raspberry Pi on USB4-test kernel
+After=network-online.target wireless.service dbus.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/usb4_netconsole_arm
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,14 @@
+[Unit]
+Description=Mirror kernel log to usb4log stick (per-line fsync)
+After=local-fs.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/usb4_kmsg_live /mnt/usb4log/live-klog.txt
+Restart=always
+RestartSec=2
+# default SIGTERM kills the blocked reader instantly; 5s is generous
+TimeoutStopSec=5
+
+[Install]
+WantedBy=multi-user.target
