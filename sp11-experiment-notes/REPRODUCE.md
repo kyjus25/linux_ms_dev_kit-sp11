@@ -45,3 +45,14 @@ arm64.nopauth systemd.tpm2_wait=0 - see /etc/grub.d/81_sp11_usb4_hr_activation).
   /sys/module/qcom_pmic_glink_altmode/parameters/{force_dp,nack_on_tbt_reject}
   (qcom_pmic_glink_altmode params only exist on the force_dp kernel in
    vmlinuz...bak-forcedp; the installed vmlinuz predates that patch)
+
+## Verification (2026-08-27)
+Fresh rebuilds at HEAD verified against the snapshot:
+- qcom_usb4_hr.ko:  srcversion MATCH (74D9020052947A7A913A48C)
+- thunderbolt.ko:   srcversion MATCH (71C56DCE6B604EA7B487AED)
+- ps883x.ko:        srcversion MATCH (39C70D709270D936D00C64A)
+- DTB:              bit-exact sha256 match
+- vmlinuz:          HEAD differs from installed by the benched built-in
+                    pmic_glink_altmode params (default-off, inert); for
+                    functional parity build at 0ff15dc, or restore the
+                    snapshotted file for bit-exact.
