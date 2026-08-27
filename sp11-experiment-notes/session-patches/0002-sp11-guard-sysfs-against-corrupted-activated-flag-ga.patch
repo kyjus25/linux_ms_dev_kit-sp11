@@ -1,0 +1,164 @@
+From e23ca58dbd32b0f70cbc44ca377718c9533d42c8 Mon Sep 17 00:00:00 2001
+From: Justin White <kyjus25@gmail.com>
+Date: Wed, 26 Aug 2026 11:52:23 -0500
+Subject: [PATCH 02/12] sp11: guard sysfs against corrupted activated flag;
+ gate deadly usbap RMW; add .remove
+
+- hr->activated is observed zeroed within seconds of activation even on
+  clean boots; sysfs guards now check tb-domain presence instead
+  (re-running bring-up on live hardware hard-locks the SoC).
+- readl(usbap_config+0x00) verified via netconsole to instantly lock up
+  the SoC (aperture unpowered without Windows platform glue); the
+  uc_usbap_rmw trigger is now behind module_param usbap_allow (default N).
+- probe now has .remove: sysfs attrs used to leak across unbind, making
+  a rebind fail with -EEXIST and stores hit stale module memory.
+---
+ drivers/thunderbolt/qcom_usb4_hr.c | 90 +++++++++++++++++++++++++++++-
+ 1 file changed, 88 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/thunderbolt/qcom_usb4_hr.c b/drivers/thunderbolt/qcom_usb4_hr.c
+index 759f8d8b2f00..b06380e7aead 100644
+--- a/drivers/thunderbolt/qcom_usb4_hr.c
++++ b/drivers/thunderbolt/qcom_usb4_hr.c
+@@ -182,6 +182,16 @@ module_param_named(skip_clamp, uc_skip_clamp, bool, 0444);
+ MODULE_PARM_DESC(skip_clamp,
+ 		 "do not touch the raw USB4 AON clamp register (deadly on X1P)");
+ 
++/*
++ * 2026-08-26: a plain readl(usbap_config+0x00) also hard-locks the SoC
++ * (verified by netconsole) - the aperture is unpowered in our state and
++ * Windows only reaches it behind platform glue we don't run. Default off.
++ */
++static bool uc_usbap_allow;
++module_param_named(usbap_allow, uc_usbap_allow, bool, 0444);
++MODULE_PARM_DESC(usbap_allow,
++		 "allow the deadly raw usbap_config RMW experiment");
++
+ static int qcom_usb4_hr_uc_bringup(struct qcom_usb4_hr *hr)
+ {
+ 	static const char * const fw_name =
+@@ -359,6 +369,23 @@ static int qcom_usb4_hr_find_tb_domain(struct device *child, const void *data)
+ 	return child->bus == &tb_bus_type;
+ }
+ 
++/*
++ * Authoritative "is the router live" check: a tb domain child device
++ * exists. hr->activated has been observed false after a successful
++ * activation (2026-08-26 round-6 incident), so sysfs guards must not
++ * trust it — re-running the bring-up on live hardware hard-locks the SoC.
++ */
++static bool qcom_usb4_hr_is_live(struct platform_device *pdev)
++{
++	struct device *tb_dev = device_find_child(&pdev->dev, NULL,
++					qcom_usb4_hr_find_tb_domain);
++
++	if (!tb_dev)
++		return false;
++	put_device(tb_dev);
++	return true;
++}
++
+ /*
+  * Writes issue a raw config-space read to the host router, testing whether
+  * the UC's command processor still answers long after the boot-time
+@@ -410,6 +437,51 @@ static ssize_t uc_ping_store(struct device *dev, struct device_attribute *attr,
+ }
+ static DEVICE_ATTR_WO(uc_ping);
+ 
++/*
++ * Replicates the Windows QcUsb4Filter post-bring-up flow: RMW of
++ * usbap_config+0x10 (0x15681010) with value/mask 0xc/0xc. The static
++ * trace shows this happens once after "router ready" and it is the best
++ * candidate for what arms UC link training. Bracketed with markers so a
++ * wedge here is attributable, like every other hardware step.
++ */
++static ssize_t uc_usbap_rmw_store(struct device *dev,
++				  struct device_attribute *attr,
++				  const char *buf, size_t count)
++{
++	struct platform_device *pdev = to_platform_device(dev);
++	struct qcom_usb4_hr *hr = platform_get_drvdata(pdev);
++	void __iomem *usbap;
++	u32 val;
++
++	if (!hr)
++		return -ENODEV;
++	if (!uc_usbap_allow) {
++		dev_info(dev,
++			 "uc_usbap: BLOCKED (usbap_allow=0; raw read is a known instant lockup)\n");
++		return -EPERM;
++	}
++	if (!qcom_usb4_hr_is_live(pdev)) {
++		dev_info(dev, "uc_usbap: UC not live yet (activated=%d)\n",
++			 hr->activated);
++		return -EPERM;
++	}
++
++	usbap = hr->regs[11]; /* usbap_config @ 0x15681000 */
++	dev_info(dev, "hr-usbap: dumping before RMW\n");
++	val = readl(usbap + 0x00);
++	dev_info(dev, "hr-usbap: 0x00=%#x\n", val);
++	val = readl(usbap + 0x10);
++	dev_info(dev, "hr-usbap: 0x10 before=%#x\n", val);
++	val = readl(usbap + 0x14);
++	dev_info(dev, "hr-usbap: 0x14=%#x\n", val);
++
++	val = qcom_usb4_hr_rmw(usbap + 0x10, 0xc, 0xc);
++	dev_info(dev, "hr-usbap: RMW 0xc/0xc done, now=%#x\n",
++		 readl(usbap + 0x10));
++	return count;
++}
++static DEVICE_ATTR_WO(uc_usbap_rmw);
++
+ /*
+  * Deferred activation: runs the full bring-up (clocks, resets, PHY, clamp
+  * release, UC firmware load/start, NHI probe) on demand. Used to start the
+@@ -426,8 +498,9 @@ static ssize_t uc_activate_store(struct device *dev,
+ 
+ 	if (!hr)
+ 		return -ENODEV;
+-	if (hr->activated) {
+-		dev_info(dev, "uc_activate: already active\n");
++	if (hr->activated || qcom_usb4_hr_is_live(pdev)) {
++		dev_info(dev, "uc_activate: already active (flag=%d live=%d)\n",
++			 hr->activated, qcom_usb4_hr_is_live(pdev));
+ 		return count;
+ 	}
+ 	if (!hr->nhi.ops) {
+@@ -499,6 +572,8 @@ static int qcom_usb4_hr_probe(struct platform_device *pdev)
+ 	ret = device_create_file(&pdev->dev, &dev_attr_uc_ping);
+ 	if (!ret)
+ 		ret = device_create_file(&pdev->dev, &dev_attr_uc_activate);
++	if (!ret)
++		ret = device_create_file(&pdev->dev, &dev_attr_uc_usbap_rmw);
+ 
+ 	dev_info(&pdev->dev,
+ 		 hr->activated ? "resource validation passed; host-router NHI is active\n" :
+@@ -510,6 +585,16 @@ static int qcom_usb4_hr_probe(struct platform_device *pdev)
+ 
+ 
+ 
++static void qcom_usb4_hr_remove(struct platform_device *pdev)
++{
++	/* No .remove meant leaked sysfs attrs survived unbind: a rebind
++	 * then failed with -EEXIST and stores could hit stale module
++	 * memory. Teardown everything probe created. */
++	device_remove_file(&pdev->dev, &dev_attr_uc_ping);
++	device_remove_file(&pdev->dev, &dev_attr_uc_activate);
++	device_remove_file(&pdev->dev, &dev_attr_uc_usbap_rmw);
++}
++
+ static const struct of_device_id qcom_usb4_hr_of_match[] = {
+ 	{ .compatible = "qcom,x1e80100-usb4-hr" },
+ 	{ .compatible = "qcom,usb4-hr" },
+@@ -519,6 +604,7 @@ MODULE_DEVICE_TABLE(of, qcom_usb4_hr_of_match);
+ 
+ static struct platform_driver qcom_usb4_hr_driver = {
+ 	.probe = qcom_usb4_hr_probe,
++	.remove = qcom_usb4_hr_remove,
+ 	.driver = {
+ 		.name = "qcom-usb4-hr",
+ 		.of_match_table = qcom_usb4_hr_of_match,
+-- 
+2.53.0
+
