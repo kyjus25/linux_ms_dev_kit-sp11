@@ -2272,3 +2272,23 @@ STRATEGIC CLOSE: the remaining unlock requires Qualcomm's unreleased
 stack. Recommended: ticket to linux-arm-msm@vger.kernel.org with our
 characterization (everything verified working except the SB handshake;
 interrupt arming crashes when replicated outside Windows context).
+
+===== MODEL CORRECTION: parade,disable-usb4 was REMOVED by 0ff15dc (2026-08-27, user-correct) =====
+User recalled a commit removing parade,disable-usb4. Pickaxe proof:
+- f92198cd5c92 (Jul series) ADDED it to x1-microsoft-denali.dtsi (both
+  SP11 retimer nodes) - the disable-usb4 workaround WAS adopted for SP11
+- 0ff15dcef410 (handoff commit) REMOVED it from both nodes to open the
+  TBT/USB4 path for the experiment
+Earlier greps missed it (searched per-variant files, not the shared
+x1-microsoft-denali.dtsi where the retimers live). Corrected model:
+- Jens's known-working config (property SET): USB4 mode rejected ->
+  TB4 docks fall back to USB3+DP ("tb4 devices usable in type-c
+  fallback mode" - jglathe, issue #16 comment today)
+- Our experiment config (property REMOVED): TBT/USB4 accepted ->
+  retimer enters TBT state -> UC sideband gap -> no training -> dark
+- NOTE: the property only gates the TYPEC_MODE_USB4 case in ps883x_set;
+  the TBT SID path (0x8087, what a TBT3 display uses) is accepted
+  regardless - so restoring the property alone would NOT light a TBT3
+  display. It would restore dock fallback though.
+- Round-18 datum still stands: when the retimer rejects TBT (our
+  reject_tbt), the ADSP retries TBT rather than falling back to DP.
