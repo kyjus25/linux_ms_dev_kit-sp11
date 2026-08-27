@@ -1,0 +1,74 @@
+Hi all,
+
+I've been testing the preliminary Hamoa USB4 QMP support on a Surface
+Pro 11 (X1P-64-100, Microsoft "Denali" board) and hit a wall that the
+series doesn't seem to cover. Everything host-side works - the USB4
+host router's UC firmware boots and reports ready, the rings come up,
+the tb domain registers - but the link never trains. I'd like to know
+whether the missing piece is known/expected to be public, or is still
+inside the Qualcomm/Parade closed stack.
+
+Hardware/firmware state, all verified on the running system:
+
+- UC block (QcUsb4Filter-compatible, compatible "qcom,x1e80100-usb4-hr",
+  windows at 0x15600000-0x15624000 and the ACPI0015 router at
+  0x1563F000): UC firmware (the segmented payload from the Windows
+  QcUsb4Filter driver, strings identify "[Nov 24 2024]") halted, loaded
+  via the {target, count, words[]} burst into the +0x13000 area, gates
+  at +0xd064/+0x8018 cleared, GO at +0x22000. Ready pulse at
+  ROUTER+0x18 BIT24 arrives deterministically.
+- nhi_probe succeeds against the ACPI0015 window; tb domain and host
+  router (domain0/0-0) register; config-space reads answer in ~170us;
+  ring 0 was used for the router DROM read.
+- Router DROM: Qualcomm serves a rev-3 DROM with text entries
+  ("Qualcomm, Inc.", "SC8380") and a trailing entry that overruns by
+  3 bytes; I now parse it tolerantly (happy to send the layout).
+- PS8830 retimers on I2C (1-0008/3-0008), mainline ps883x driver
+  including the TBT3/USB4 CONN_STATUS_2 handling: after plug,
+  reg0x00=0x03 (present+reversed), reg0x02=0x01 (TBT_CONNECTED) -
+  verified by i2cdump; idle-port control dump differs correctly.
+- ADSP chain: pmic_glink_altmode delivers the TBT notification
+  (svid=0x8087, mux=4 tunneling) on plug.
+- QMP PHY (fd5000, x1e80100-qmp-usb3-dp-phy with the USB4 P2RR2P
+  clock) set to PHY_MODE_TBT/TBT3 per the preliminary USB4 series;
+  PCS init completes on all lanes.
+
+The failure: the UC never starts link training. PORT_CS_18 on the
+USB4 port adapter reads 0x10 (TIP=0) before and after plug, the UC
+sideband window is static, and no ring events or UC interrupts
+(GSI 287 = DT SPI 255, which I have armed) ever arrive on plug.
+The UC firmware strings ("Waiting for SB RX Connect",
+"Failed read SB LINK_CFG") say it is blocked on the sideband channel
+to the retimer coming up.
+
+Things I've ruled out: retimer configuration (per current mainline,
+and I've also exercised the USB4_CONNECTED bit directly), PHY mode,
+ADSP notification, the router bring-up sequence (replicated from a
+decoded write trace of QcUsb4Filter), and the DROM parser.
+
+Things that crash: reads of usbap_config (0x15681000) and the uc
+mailbox (0x15623000) windows hard-lock the SoC, and replaying the
+filter's UC interrupt-arming sequence (router+0x20a8 enables etc.)
+also faults - so there is context around those windows I cannot see.
+
+Questions:
+
+1. For the UC-router design, is the UC<->PS8830 sideband expected to
+   connect autonomously once both sides report TBT mode, or is there
+   host-side configuration beyond the mainline ps883x driver (SB
+   enable, mode register, relay via the ADSP) that I'm missing?
+2. Is the firmware payload from the Windows filter the complete,
+   current UC firmware for standalone (non-Windows) use, or does it
+   depend on Windows-side setup that has no Linux equivalent yet?
+3. Is there any register-level documentation that can be shared for
+   the 0x15600000 UC block (in particular the interrupt controller at
+   +0x20a8 and the sideband interface at +0x12000)?
+
+Full traces available: register-level DROM dump, PS8830 register
+dumps (both ports, multiple states), the complete QcUsb4Filter boot
+write trace, ACPI tables (DSDT decompiled), and a netconsole/ramoops
+setup for reproducible testing. I can test patches on demand - the
+machine boots a dedicated experimental kernel for this.
+
+Thanks,
+<name>
