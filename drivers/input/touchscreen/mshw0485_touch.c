@@ -405,6 +405,17 @@ static bool g6ts_ipts_shim = true;
 module_param_named(ipts_shim, g6ts_ipts_shim, bool, 0444);
 MODULE_PARM_DESC(ipts_shim, "Expose the IPTS-compatible hidraw shim device");
 
+/*
+ * Mirroring raw Heat records onto the panel-descriptor HID device is off by
+ * default: hid-generic attaches input processing to that device, and raw
+ * Heat record bytes parsed against the panel report descriptor produce a
+ * phantom pointer.  Raw access belongs on /dev/g6ts-heat and the shim device.
+ */
+static bool g6ts_heat_hidraw_mirror;
+module_param_named(heat_hidraw_mirror, g6ts_heat_hidraw_mirror, bool, 0444);
+MODULE_PARM_DESC(heat_hidraw_mirror,
+		 "Mirror raw Heat records to the panel-descriptor hidraw (phantom pointer risk)");
+
 static unsigned int g6ts_ipts_contact_on_energy = 3200000;
 module_param_named(ipts_contact_on_energy, g6ts_ipts_contact_on_energy,
 		   uint, 0444);
@@ -713,6 +724,9 @@ struct g6ts_ipts {
 	u64 unanchored_records;
 	u64 sideband_records;
 	u64 dropped_cycles;
+	u64 position_found;
+	u64 pressure_found;
+	u64 inject_errors;
 };
 
 struct g6ts {
@@ -1214,6 +1228,7 @@ static size_t g6ts_ipts_append_window(u8 *out, size_t at, u8 dft_type,
 static void g6ts_ipts_inject(struct g6ts *ts, size_t len)
 {
 	struct g6ts_ipts *ip = ts->ipts;
+	int ret;
 
 	if (!ip->ready || !ip->inject_buf || len > G6TS_IPTS_REPORT_LEN)
 		return;
@@ -1223,8 +1238,10 @@ static void g6ts_ipts_inject(struct g6ts *ts, size_t len)
 	 * input events, and iptsd's parser ignores the trailing zeros.
 	 */
 	memset(ip->inject_buf + len, 0, G6TS_IPTS_REPORT_LEN - len);
-	hid_input_report(ip->hid, HID_INPUT_REPORT, ip->inject_buf,
-			 G6TS_IPTS_REPORT_LEN, 1);
+	ret = hid_input_report(ip->hid, HID_INPUT_REPORT, ip->inject_buf,
+			       G6TS_IPTS_REPORT_LEN, 1);
+	if (ret)
+		ip->inject_errors++;
 }
 
 static void g6ts_ipts_emit_cycle(struct g6ts *ts)
@@ -1389,6 +1406,10 @@ static void g6ts_ipts_process_cycle(struct g6ts *ts)
 
 	g6ts_ipts_scan_position(ip);
 	g6ts_ipts_scan_pressure(ip);
+	if (ip->has_position)
+		ip->position_found++;
+	if (ip->has_pressure)
+		ip->pressure_found++;
 	g6ts_ipts_emit_cycle(ts);
 }
 
@@ -1649,14 +1670,10 @@ static int g6ts_ipts_register(struct g6ts *ts)
 		return ret;
 	}
 
-	ret = hid_hw_start(hid, HID_CONNECT_HIDRAW);
-	if (ret) {
-		hid_destroy_device(hid);
-		dev_warn(&ts->spi->dev,
-			 "failed to start the G6 IPTS shim device: %d\n", ret);
-		return ret;
-	}
-
+	/*
+	 * hid_add_device binds a hid driver whose connect creates the hidraw
+	 * node; a second hid_hw_start here would create a duplicate.
+	 */
 	ts->ipts->hid = hid;
 	ts->ipts->ready = true;
 	dev_info(&ts->spi->dev,
@@ -2179,6 +2196,41 @@ static ssize_t feedback_state_show(struct device *dev,
 }
 static DEVICE_ATTR_RO(feedback_state);
 
+static ssize_t ipts_stats_show(struct device *dev,
+			       struct device_attribute *attr, char *buf)
+{
+	struct g6ts *ts = dev_get_drvdata(dev);
+	struct g6ts_ipts *ip;
+	ssize_t len;
+
+	mutex_lock(&ts->io_lock);
+	ip = ts->ipts;
+	if (ip)
+		len = sysfs_emit(buf,
+				 "ready %d\n"
+				 "contact %d\n"
+				 "cycles %llu\n"
+				 "lifts %llu\n"
+				 "position_found %llu\n"
+				 "pressure_found %llu\n"
+				 "inject_errors %llu\n"
+				 "dropped_cycles %llu\n"
+				 "incomplete_cycles %llu\n"
+				 "unanchored_records %llu\n"
+				 "sideband_records %llu\n",
+				 ip->ready, ip->contact, ip->cycles,
+				 ip->lifts, ip->position_found,
+				 ip->pressure_found, ip->inject_errors,
+				 ip->dropped_cycles, ip->incomplete_cycles,
+				 ip->unanchored_records, ip->sideband_records);
+	else
+		len = sysfs_emit(buf, "ready 0\n");
+	mutex_unlock(&ts->io_lock);
+
+	return len;
+}
+static DEVICE_ATTR_RO(ipts_stats);
+
 static ssize_t report_descriptor_read(struct file *filp, struct kobject *kobj,
 				      const struct bin_attribute *attr,
 				      char *buf, loff_t off, size_t count)
@@ -2332,14 +2384,10 @@ static int g6ts_hid_register(struct g6ts *ts)
 		return ret;
 	}
 
-	ret = hid_hw_start(hid, HID_CONNECT_HIDRAW);
-	if (ret) {
-		hid_destroy_device(hid);
-		dev_warn(&ts->spi->dev,
-			 "failed to start the G6 HID device: %d\n", ret);
-		return ret;
-	}
-
+	/*
+	 * hid_add_device binds a hid driver whose connect creates the hidraw
+	 * node; a second hid_hw_start here would create a duplicate.
+	 */
 	ts->hid = hid;
 	ts->hid_ready = true;
 	dev_info(&ts->spi->dev,
@@ -2353,6 +2401,7 @@ static struct attribute *g6ts_attributes[] = {
 	&dev_attr_behavior_stats.attr,
 	&dev_attr_report_counts.attr,
 	&dev_attr_feedback_state.attr,
+	&dev_attr_ipts_stats.attr,
 	NULL,
 };
 
@@ -3871,8 +3920,10 @@ static void g6ts_handle_data_report(struct g6ts *ts)
 		return;
 	ts->report_counts[ts->last_content_id]++;
 
-	/* Make every HEAT record visible on the HID interface (hidraw). */
-	if (ts->hid_ready && ts->hid_inject_buf &&
+	/* Mirror raw Heat records onto the HID interface (hidraw) only when
+	 * explicitly requested; the parsed garbage on the panel-descriptor
+	 * device creates a phantom pointer otherwise. */
+	if (g6ts_heat_hidraw_mirror && ts->hid_ready && ts->hid_inject_buf &&
 	    ts->last_content_len <= G6TS_MAX_BODY) {
 		ts->hid_inject_buf[0] = ts->last_content_id;
 		memcpy(ts->hid_inject_buf + 1, payload, ts->last_content_len);
@@ -4834,6 +4885,12 @@ static int g6ts_full_reinitialize_locked(struct g6ts *ts,
 			ret = 0; /* the panel still works without HID */
 	}
 
+	if (g6ts_ipts_shim && ts->ipts && !ts->ipts->ready) {
+		ret = g6ts_ipts_register(ts);
+		if (ret)
+			ret = 0; /* the panel still works without the shim */
+	}
+
 	if (g6ts_windows_init_parity) {
 		/* A software reset has a different, multi-owner Windows ordering. */
 		if (path != G6TS_RECOVERY_HARDWARE) {
@@ -5121,10 +5178,12 @@ static int g6ts_probe(struct spi_device *spi)
 		if (!ts->ipts->inject_buf)
 			return -ENOMEM;
 		INIT_DELAYED_WORK(&ts->ipts->stale_work, g6ts_ipts_stale_work);
-		ret = g6ts_ipts_register(ts);
-		if (ret)
-			return dev_err_probe(&spi->dev, ret,
-					     "failed to register the IPTS shim device\n");
+		/*
+		 * The shim HID device itself is registered once the panel
+		 * descriptor has been validated and the real product id is
+		 * known (g6ts_full_reinitialize_locked), so it matches the
+		 * panel identity instead of 045e:0000.
+		 */
 		ret = devm_add_action_or_reset(&spi->dev,
 					       g6ts_ipts_unregister_action,
 					       ts);
