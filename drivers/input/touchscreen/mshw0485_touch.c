@@ -9,6 +9,7 @@
 #include <linux/fs.h>
 #include <linux/g6ts_heat.h>
 #include <linux/gpio/consumer.h>
+#include <linux/hid.h>
 #include <linux/hid-over-spi.h>
 #include <linux/input.h>
 #include <linux/input/mt.h>
@@ -534,6 +535,9 @@ struct g6ts {
 	struct spi_device *spi;
 	struct input_dev *input;
 	struct g6ts_heat_device *heat;
+	struct hid_device *hid;
+	bool hid_ready;
+	u8 *hid_inject_buf;
 	struct input_dev *pen_input;
 	struct touchscreen_properties prop;
 	struct touchscreen_properties pen_prop;
@@ -557,6 +561,10 @@ struct g6ts {
 	u8 last_class;
 	u16 last_content_len;
 	u16 expected_report_descriptor_len;
+	u16 product_id;
+	u8 report_descriptor[G6TS_SP11_REPORT_DESCRIPTOR_LEN];
+	u16 report_descriptor_len;
+	bool report_descriptor_valid;
 	u8 last_content_id;
 	/* Phase 72 Linux response content used by the combined experimental path. */
 	u8 mode_config[G6TS_FEATURE_RESPONSE_LIMIT];
@@ -1211,6 +1219,158 @@ static ssize_t feedback_state_show(struct device *dev,
 }
 static DEVICE_ATTR_RO(feedback_state);
 
+static ssize_t report_descriptor_read(struct file *filp, struct kobject *kobj,
+				      const struct bin_attribute *attr,
+				      char *buf, loff_t off, size_t count)
+{
+	struct device *dev = kobj_to_dev(kobj);
+	struct g6ts *ts = dev_get_drvdata(dev);
+	size_t avail;
+
+	mutex_lock(&ts->io_lock);
+	if (!ts->report_descriptor_valid || off >= ts->report_descriptor_len) {
+		mutex_unlock(&ts->io_lock);
+		return 0;
+	}
+	avail = min_t(size_t, count,
+		      ts->report_descriptor_len - (size_t)off);
+	memcpy(buf, ts->report_descriptor + off, avail);
+	mutex_unlock(&ts->io_lock);
+
+	return avail;
+}
+static BIN_ATTR_RO(report_descriptor, G6TS_SP11_REPORT_DESCRIPTOR_LEN);
+
+/*
+ * Minimal HID low-level transport: the G6 driver owns the HID-over-SPI
+ * handshakes, so the HID layer only parses the panel-provided report
+ * descriptor and feeds the hidraw interface.  Feature 0x70 (the cached
+ * streaming mode configuration) is served from driver memory without
+ * touching the panel.
+ */
+static int g6ts_hid_start(struct hid_device *hdev)
+{
+	return 0;
+}
+
+static void g6ts_hid_stop(struct hid_device *hdev)
+{
+}
+
+static int g6ts_hid_open(struct hid_device *hdev)
+{
+	return 0;
+}
+
+static void g6ts_hid_close(struct hid_device *hdev)
+{
+}
+
+static int g6ts_hid_parse(struct hid_device *hdev)
+{
+	struct g6ts *ts = hid_get_drvdata(hdev);
+
+	if (!ts->report_descriptor_valid)
+		return -ENODATA;
+
+	return hid_parse_report(hdev, ts->report_descriptor,
+				ts->report_descriptor_len);
+}
+
+static int g6ts_hid_raw_request(struct hid_device *hdev,
+				unsigned char reportnum, u8 *buf,
+				size_t len, unsigned char rtype, int reqtype)
+{
+	struct g6ts *ts = hid_get_drvdata(hdev);
+
+	if (rtype == HID_FEATURE_REPORT && reqtype == HID_REQ_GET_REPORT &&
+	    reportnum == 0x70) {
+		mutex_lock(&ts->io_lock);
+		if (!ts->mode_config_valid) {
+			mutex_unlock(&ts->io_lock);
+			return -ENODATA;
+		}
+		if (len > ts->mode_config_len)
+			len = ts->mode_config_len;
+		memcpy(buf, ts->mode_config, len);
+		mutex_unlock(&ts->io_lock);
+
+		return len;
+	}
+
+	return -ENOSYS;
+}
+
+static const struct hid_ll_driver g6ts_hid_ll_driver = {
+	.start = g6ts_hid_start,
+	.stop = g6ts_hid_stop,
+	.open = g6ts_hid_open,
+	.close = g6ts_hid_close,
+	.parse = g6ts_hid_parse,
+	.raw_request = g6ts_hid_raw_request,
+	.max_buffer_size = G6TS_MAX_BODY,
+};
+
+static void g6ts_hid_unregister(struct g6ts *ts)
+{
+	if (!ts->hid)
+		return;
+	hid_hw_stop(ts->hid);
+	hid_destroy_device(ts->hid);
+	ts->hid = NULL;
+	ts->hid_ready = false;
+}
+
+static int g6ts_hid_register(struct g6ts *ts)
+{
+	struct hid_device *hid;
+	int ret;
+
+	if (ts->hid)
+		return 0;
+	if (!ts->report_descriptor_valid)
+		return -ENODATA;
+
+	hid = hid_allocate_device();
+	if (IS_ERR(hid))
+		return PTR_ERR(hid);
+
+	hid->version = G6TS_SP11_VERSION_ID;
+	hid->vendor = G6TS_SP11_VENDOR_ID;
+	hid->product = ts->product_id;
+	hid->bus = BUS_SPI;
+	hid->dev.parent = &ts->spi->dev;
+	snprintf(hid->name, sizeof(hid->name), "%s %04X:%04X",
+		 "Microsoft Surface G6", G6TS_SP11_VENDOR_ID,
+		 ts->product_id);
+	hid->ll_driver = &g6ts_hid_ll_driver;
+	hid_set_drvdata(hid, ts);
+
+	ret = hid_add_device(hid);
+	if (ret) {
+		hid_destroy_device(hid);
+		dev_warn(&ts->spi->dev,
+			 "failed to register the G6 HID device: %d\n", ret);
+		return ret;
+	}
+
+	ret = hid_hw_start(hid, HID_CONNECT_HIDRAW);
+	if (ret) {
+		hid_destroy_device(hid);
+		dev_warn(&ts->spi->dev,
+			 "failed to start the G6 HID device: %d\n", ret);
+		return ret;
+	}
+
+	ts->hid = hid;
+	ts->hid_ready = true;
+	dev_info(&ts->spi->dev,
+		 "G6 HID interface registered (%u-byte report descriptor)\n",
+		 ts->report_descriptor_len);
+
+	return 0;
+}
+
 static struct attribute *g6ts_attributes[] = {
 	&dev_attr_behavior_stats.attr,
 	&dev_attr_report_counts.attr,
@@ -1218,8 +1378,14 @@ static struct attribute *g6ts_attributes[] = {
 	NULL,
 };
 
+static const struct bin_attribute * const g6ts_bin_attributes[] = {
+	&bin_attr_report_descriptor,
+	NULL,
+};
+
 static const struct attribute_group g6ts_attribute_group = {
 	.attrs = g6ts_attributes,
+	.bin_attrs = g6ts_bin_attributes,
 };
 
 static int g6ts_acpi_method(struct device *dev, const char *method)
@@ -2725,6 +2891,16 @@ static void g6ts_handle_data_report(struct g6ts *ts)
 	if (ts->last_class != DATA)
 		return;
 	ts->report_counts[ts->last_content_id]++;
+
+	/* Make every HEAT record visible on the HID interface (hidraw). */
+	if (ts->hid_ready && ts->hid_inject_buf &&
+	    ts->last_content_len <= G6TS_MAX_BODY) {
+		ts->hid_inject_buf[0] = ts->last_content_id;
+		memcpy(ts->hid_inject_buf + 1, payload, ts->last_content_len);
+		hid_input_report(ts->hid, HID_INPUT_REPORT, ts->hid_inject_buf,
+				 ts->last_content_len + 1, 1);
+	}
+
 	/* Preserve raw pen measurements before touch-readiness can discard them. */
 	if (g6ts_is_raw_export_report(ts->last_content_id))
 		g6ts_heat_enqueue(ts, ts->last_content_id, payload,
@@ -3092,6 +3268,8 @@ static int g6ts_validate_sp11_device_descriptor(struct g6ts *ts)
 
 	descriptor = (const struct hidspi_dev_descriptor *)
 		(ts->body + HIDSPI_INPUT_BODY_HEADER_SIZE);
+	/* Cache the panel's own product id for the HID device identity. */
+	ts->product_id = le16_to_cpu(descriptor->product_id);
 	if (le16_to_cpu(descriptor->dev_desc_len) !=
 			HIDSPI_DEVICE_DESCRIPTOR_SIZE ||
 	    le16_to_cpu(descriptor->bcd_ver) != 0x0300 ||
@@ -3658,6 +3836,21 @@ static int g6ts_full_reinitialize_locked(struct g6ts *ts,
 		goto out;
 	}
 
+	/* Keep the panel's own report descriptor: it is the objective
+	 * reference for HID userspace compatibility and it backs the
+	 * hidraw interface registered below.
+	 */
+	if (!ts->report_descriptor_valid) {
+		memcpy(ts->report_descriptor,
+		       ts->body + HIDSPI_INPUT_BODY_HEADER_SIZE,
+		       ts->last_content_len);
+		ts->report_descriptor_len = ts->last_content_len;
+		ts->report_descriptor_valid = true;
+		ret = g6ts_hid_register(ts);
+		if (ret)
+			ret = 0; /* the panel still works without HID */
+	}
+
 	if (g6ts_windows_init_parity) {
 		/* A software reset has a different, multi-owner Windows ordering. */
 		if (path != G6TS_RECOVERY_HARDWARE) {
@@ -3894,6 +4087,10 @@ static int g6ts_probe(struct spi_device *spi)
 	ts->body = devm_kmalloc(&spi->dev, G6TS_MAX_BODY, GFP_KERNEL);
 	if (!ts->body)
 		return -ENOMEM;
+	ts->hid_inject_buf = devm_kmalloc(&spi->dev, G6TS_MAX_BODY + 1,
+					  GFP_KERNEL);
+	if (!ts->hid_inject_buf)
+		return -ENOMEM;
 	ts->spi = spi;
 	/*
 	 * Initial attach A5 carries sequence zero.  Streaming starts at one and
@@ -4028,6 +4225,7 @@ static void g6ts_remove(struct spi_device *spi)
 	WRITE_ONCE(ts->stopping, true);
 	WRITE_ONCE(ts->mode_enabled, false);
 	cancel_delayed_work_sync(&ts->recovery_work);
+	g6ts_hid_unregister(ts);
 	mutex_lock(&ts->io_lock);
 	g6ts_release_inputs(ts);
 	mutex_unlock(&ts->io_lock);
