@@ -1004,7 +1004,8 @@ static bool g6ts_ipts_fill_banks(const u8 *payload, u16 payload_len,
 	banks->count = count;
 	for (bank = 0; bank < 2; bank++) {
 		for (vector = 0; vector < count; vector++) {
-			g6ts_ipts_parse_vector(bank == 0 ? banks->x : banks->y,
+			g6ts_ipts_parse_vector(bank == 0 ? &banks->x[vector] :
+						       &banks->y[vector],
 					       payload + 12 +
 					       (bank * count + vector) *
 					       G6TS_IPTS_VECTOR_LEN);
