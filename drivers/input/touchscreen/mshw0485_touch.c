@@ -265,10 +265,10 @@ MODULE_PARM_DESC(reset_storm_breaker,
  * explicit and observable.  It uses the already proven cold hardware path;
  * it does not invent another panel command sequence.
  */
-static bool g6ts_host_fault_recovery;
+static bool g6ts_host_fault_recovery = true;
 module_param_named(host_fault_recovery, g6ts_host_fault_recovery, bool, 0444);
 MODULE_PARM_DESC(host_fault_recovery,
-		 "Recover with a cold re-enumeration after an IRQ transport/protocol fault (default: false)");
+		 "Recover with a cold re-enumeration after an IRQ transport/protocol fault (default: true)");
 
 /*
  * Phase 80 live evidence found invalid second headers immediately after valid
@@ -277,10 +277,10 @@ MODULE_PARM_DESC(host_fault_recovery,
  * treats an invalid header as an empty trailing read only if ready deasserted;
  * a still-asserted line remains a real protocol fault handled by Phase 80.
  */
-static bool g6ts_ready_quiesce;
+static bool g6ts_ready_quiesce = true;
 module_param_named(ready_quiesce, g6ts_ready_quiesce, bool, 0444);
 MODULE_PARM_DESC(ready_quiesce,
-		 "Ignore one invalid trailing header after GPIO51 deasserts (default: false)");
+		 "Ignore one invalid trailing header after GPIO51 deasserts (default: true)");
 
 /*
  * Evidence-only cold-attach path.  It follows the byte-exact Windows cold
