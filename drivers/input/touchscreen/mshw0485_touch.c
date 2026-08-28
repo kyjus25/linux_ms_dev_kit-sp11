@@ -416,6 +416,11 @@ module_param_named(heat_hidraw_mirror, g6ts_heat_hidraw_mirror, bool, 0444);
 MODULE_PARM_DESC(heat_hidraw_mirror,
 		 "Mirror raw Heat records to the panel-descriptor hidraw (phantom pointer risk)");
 
+static bool g6ts_panel_hidraw;
+module_param_named(panel_hidraw, g6ts_panel_hidraw, bool, 0444);
+MODULE_PARM_DESC(panel_hidraw,
+		 "Expose the diagnostic panel-descriptor HID device (phantom input risk)");
+
 static unsigned int g6ts_ipts_contact_on_energy = 3200000;
 module_param_named(ipts_contact_on_energy, g6ts_ipts_contact_on_energy,
 		   uint, 0444);
@@ -4871,9 +4876,11 @@ static int g6ts_full_reinitialize_locked(struct g6ts *ts,
 		goto out;
 	}
 
-	/* Keep the panel's own report descriptor: it is the objective
-	 * reference for HID userspace compatibility and it backs the
-	 * hidraw interface registered below.
+	/* Keep the panel's own report descriptor as the objective reference for
+	 * HID userspace compatibility.  Its diagnostic HID device stays opt-in:
+	 * hid-generic creates touchscreen and stylus input nodes from this
+	 * descriptor, and even an otherwise inert node can leave a phantom cursor.
+	 * Raw HEAT access belongs on /dev/g6ts-heat and the IPTS shim.
 	 */
 	if (!ts->report_descriptor_valid) {
 		memcpy(ts->report_descriptor,
@@ -4881,9 +4888,11 @@ static int g6ts_full_reinitialize_locked(struct g6ts *ts,
 		       ts->last_content_len);
 		ts->report_descriptor_len = ts->last_content_len;
 		ts->report_descriptor_valid = true;
-		ret = g6ts_hid_register(ts);
-		if (ret)
-			ret = 0; /* the panel still works without HID */
+		if (g6ts_panel_hidraw) {
+			ret = g6ts_hid_register(ts);
+			if (ret)
+				ret = 0; /* the panel still works without HID */
+		}
 	}
 
 	if (g6ts_ipts_shim && ts->ipts && !ts->ipts->ready) {
