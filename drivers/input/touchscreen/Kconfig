@@ -1416,7 +1416,7 @@ config TOUCHSCREEN_HIMAX_HX83112B
 
 config TOUCHSCREEN_MSHW0485
 	tristate "Microsoft Surface G6 MSHW0485 touchscreen"
-	depends on SPI
+	depends on HID && SPI
 	help
 	  Say Y here to enable support for the Microsoft Surface G6 (MSHW0485)
 	  touchscreen found on the Surface Pro 11.
