@@ -659,6 +659,7 @@ static const u8 g6ts_ipts_metadata_feature[113] = {
 #define G6TS_IPTS_MAX_VECTORS		16
 #define G6TS_IPTS_VECTOR_LEN		48
 #define G6TS_IPTS_COMPONENTS		9
+#define G6TS_IPTS_MIN_POSITION_AMP	64
 
 /* IPTS report frame and DFT window type codes consumed by stock iptsd. */
 #define G6TS_IPTS_FRAME_REPORTS		0xff
@@ -1118,9 +1119,12 @@ static void g6ts_ipts_scan_pressure(struct g6ts_ipts *ip)
  * Rotate one antenna row onto the phase of its center component using 15-bit
  * fixed point, so the center component becomes (A, 0) with A the saturated
  * center amplitude.  The stock DFT solver raises the two neighbor
- * projections to a negative exponent; a negative projection would produce
- * NaN there and be misread as a stylus lift, so non-center real parts are
- * clamped non-negative, mirroring the amplitude clamp of the iptsd branch.
+ * projections to a negative exponent.  A negative projection produces NaN
+ * and a zero projection produces infinity; either is misread as a stylus
+ * lift.  Keep non-empty neighbors strictly positive after rotation.  Also
+ * raise a valid center to the stock iptsd amplitude floor while preserving
+ * its phase and the component ratios.  Truly empty neighbors stay zero so
+ * iptsd can retain its off-screen edge handling.
  */
 static void g6ts_ipts_normalize_row(struct g6ts_ipts_vector *v)
 {
@@ -1138,11 +1142,12 @@ static void g6ts_ipts_normalize_row(struct g6ts_ipts_vector *v)
 
 	norm = int_sqrt(norm2);
 	norm2sq = (u64)norm * norm;
-	a = min_t(u32, norm, S16_MAX);
+	a = clamp_t(u32, norm, G6TS_IPTS_MIN_POSITION_AMP, S16_MAX);
 	cq = (s64)re_c * a * 32768 / (s64)norm2sq;
 	sq = (s64)im_c * a * 32768 / (s64)norm2sq;
 
 	for (i = 0; i < G6TS_IPTS_COMPONENTS; i++) {
+		bool empty = !v->real[i] && !v->imag[i];
 		s64 re, im;
 
 		if (i == 4) {
@@ -1156,8 +1161,8 @@ static void g6ts_ipts_normalize_row(struct g6ts_ipts_vector *v)
 		im = ((s64)v->imag[i] * cq - (s64)v->real[i] * sq +
 		      (1 << 14)) >> 15;
 
-		if (re < 0)
-			re = 0;
+		if (re < 1)
+			re = empty ? 0 : 1;
 		else if (re > S16_MAX)
 			re = S16_MAX;
 		if (im < S16_MIN)
